@@ -328,8 +328,12 @@ class MoEGate(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.n_routed_experts = config.n_routed_experts
 
+
+        #打分函数的选择
         self.scoring_func = config.scoring_func
+        #alpha用户控制辅助损失的权重
         self.alpha = config.aux_loss_alpha
+        #seq_aux控制是否使用序列辅助损失还是aux_loss损失
         self.seq_aux = config.seq_aux
 
         self.norm_topk_prob = config.norm_topk_prob
@@ -340,13 +344,23 @@ class MoEGate(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        #kaiming初始化
+        #resnet的提出者
+        #初始化方法是可以方便的初始化一些参数，更好的训练网络，避免梯度爆炸和梯度消失
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, hidden_states):
+        #moe的时候，只看token值，不关心位置 ，所以我们可以合并batch和seq_len维度
+
         bsz, seq_len, h = hidden_states.shape
-        hidden_states = hidden_states.view(-1, h)
+        hidden_states = hidden_states.view(-1, h)  # [bsz*seq_len, h]
+
+        #linear映射计算出每个token对expert的logits
         logits = F.linear(hidden_states, self.weight, None)
 
+
+        #合并之后，对权重进行线性映射，计算出每个token对expert的打分
+        #使用softmax函数，将打分转换为概率，进行打分归一化
         if self.scoring_func == "softmax":
             scores = logits.softmax(dim=-1)
         else:
@@ -354,10 +368,22 @@ class MoEGate(nn.Module):
                 f"insupportable scoring function for MoE gating: {self.scoring_func}"
             )
 
+
+        #第一种方法：序列级别的aux_loss
+        #第二种方法：batch级别的aux_loss
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
 
+
+        #----------第一步：权重归一化
+        #当选择多个专家的时候，需要对多个选中的专家进行标准化
+        #目的：确保每个token多个专家的权重之和为1，避免权重积累过大
         if self.top_k > 1 and self.norm_topk_prob:
-            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+
+            #topk_weight：[bsz*seq_len, top_k]
+            #对每个token的top_k权重求和->shape:[bsz*seq_len,1]
+            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20  # 防止除0
+
+
             topk_weight = topk_weight / denominator
 
         if self.training and self.alpha > 0.0:

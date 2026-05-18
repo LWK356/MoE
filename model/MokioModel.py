@@ -350,6 +350,9 @@ class MoEGate(nn.Module):
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, hidden_states):
+
+        #整体逻辑是：先计算使用率，在计算分数，两者相乘，在计算
+
         #moe的时候，只看token值，不关心位置 ，所以我们可以合并batch和seq_len维度
 
         bsz, seq_len, h = hidden_states.shape
@@ -386,32 +389,90 @@ class MoEGate(nn.Module):
 
             topk_weight = topk_weight / denominator
 
+
+
+        #---------第二步：计算辅助损失----------
+        #辅助损失的作用，确保负载均衡，防止所有token都流向少数专家是对模型进行正则化，避免模型过拟合
+        #类比：一家医院，我们要确保每个科室都充分工作，避免某些科室过载
+
+        #判断在训练模式下并且alpha大于0,才计算训练损失
+
         if self.training and self.alpha > 0.0:
-            scores_for_aux = scores
+            scores_for_aux = scores #保证原始函数计算辅助损失
             aux_topk = self.top_k
+
+            #将topk_idx从[bsz*seq_len, top_k]恢复成[bsz, top_k]，恢复index
             topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
+
+            #----方式1：序列级辅助损失(seq_aux=True时)--
+            #seq_aux bool参数
             if self.seq_aux:
+
+                #恢复scores维度：[bsz, seq_len, n_routed_experts]
+                #恢复score值
                 scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+
+                #统计每个batch中每个专家被选中的次数
+                #ce:[bsz, n_routed_experts],表示每个专家的被选中的次数
                 ce = torch.zeros(
                     bsz, self.n_routed_experts, device=hidden_states.device
                 )
+
+
+                #ce.scatter_add_：根据topk_idx_for_aux_loss中的值，将1累加到ce对应的位置
+                #例如：如果是topk_idx_for_aux_loss[0]=[1,3],则则ce[0][1]+=1,ce[0][3]+=1
                 ce.scatter_add_(
                     1,
                     topk_idx_for_aux_loss,
                     torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device),
-                ).div_(seq_len * aux_topk / self.n_routed_experts)
+                ).div_(seq_len * aux_topk / self.n_routed_experts) #计算每个专家的平均使用率，ce除以
+                #计算每个专家的平均使用率，ce除以总的选择数，得到每个专家的比例
+                #比如说我之ce的值是[20,50,10,10,10],总共100个选择
+                #那么除以100之后，变成了[0.2,0.5,0.1,0.1,0.1]
+                #[bsz, n_routed_experts]
+
+
+
+
+
+                #计算辅助损失：
+                # ce*scores_for_seq_aux.mean(dim=1)
+                # =专家使用率*该专家的平局分数
+                # 目的：鼓励所有专家获得相似的分数和使用率每个专家的均值使用率，并求和
                 aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(
                     dim=1
                 ).mean() * self.alpha
+
+
+                # ----方式2：batch级别的辅助损失(seq_aux=False时)--
             else:
+                #将token_idx展平，从[bsz*seq_len, top_k]恢复成[bsz, seq_len, top_k]，恢复index
+                #转化成one_hot编码,得到[bsz*seq_len*top_k, n_routed_experts]
+                #举个例子：如果n_routed_experts=5, topk_idx_for_aux_loss=[0,1,2,3,4]
+                # mask_ce=[
+                #         [1,0,0,0,0],
+                #         [0,1,0,0,0],
+                #         [0,0,1,0,0],
+                #         [0,0,0,1,0],
+                #         [0,0,0,0,1]]
                 mask_ce = F.one_hot(
                     topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts
                 )
+
+                #ce:[n_routed_experts],表示整个batch中每个专家的平均选择率
+                #比如[0.2,0.5,0.1,0.1,0.1]表示专家1被选择的次数为20，专家2被选择的次数为50，以此类推
                 ce = mask_ce.float().mean(0)
+
+
+                #Pi:[n_routed_experts],表示整个batch中每个专家的均值分数
                 Pi = scores_for_aux.mean(0)
+
+                #fi：标准化的专家选择率（乘n_routed_experts确保均衡）
                 fi = ce * self.n_routed_experts
                 aux_loss = (Pi * fi).sum() * self.alpha
         else:
+
+            #推理时或者alpha=0时，不计算辅助损失
             aux_loss = scores.new_zeros(1).squeeze()
         return topk_idx, topk_weight, aux_loss
 
